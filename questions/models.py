@@ -1,28 +1,72 @@
 from django.db import models
-import fitz
+import fitz  # PyMuPDF
 from transformers import T5ForConditionalGeneration, T5Tokenizer
 import torch
+import os
+import logging
+from django.db import transaction
 
-class DocumentManager:
-    def __init__(self):
-        self.model_name = "google/flan-t5-base"
-        self.tokenizer = T5Tokenizer.from_pretrained(self.model_name)
-        self.model = T5ForConditionalGeneration.from_pretrained(self.model_name)
 
-    def generate_questions(self, text):
-        input_text = self.create_prompt(text)
-        input_ids = self.tokenizer(input_text, return_tensors="pt", max_length=1024, truncation=True).input_ids
-        outputs = self.model.generate(input_ids, max_length=512, num_return_sequences=1, num_beams=4)
-        generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        return self.parse_generated_text(generated_text)
+
+logger = logging.getLogger(__name__)
+
+
+class Document(models.Model):
+    file = models.FileField(upload_to='documents/')
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    def extract_text(self):
+        try:
+            logger.info(f"Extrayendo texto de {self.file.path}")
+            with fitz.open(self.file.path) as doc:
+                text = ""
+                for page in doc:
+                    text += page.get_text()
+            logger.info(f"Texto extraído, longitud: {len(text)}")
+            return text
+        except Exception as e:
+            logger.error(f"Error al extraer texto: {str(e)}")
+            raise
+
+    @transaction.atomic
+    def generate_questions(self):
+        try:
+            text = self.extract_text()
+
+            logger.info("Cargando modelo y tokenizer")
+            model_name = "google/flan-t5-base"
+            tokenizer = T5Tokenizer.from_pretrained(model_name)
+            model = T5ForConditionalGeneration.from_pretrained(model_name)
+
+            logger.info("Generando prompt")
+            input_text = self.create_prompt(text)
+            input_ids = tokenizer(input_text, return_tensors="pt", max_length=1024, truncation=True).input_ids
+
+            logger.info("Generando respuesta del modelo")
+            outputs = model.generate(input_ids, max_length=512, num_return_sequences=1, num_beams=4)
+            generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+            logger.info("Parseando preguntas generadas")
+            questions = self.parse_generated_text(generated_text)
+            logger.info(f"Número de preguntas parseadas: {len(questions)}")
+
+            logger.info("Guardando preguntas en la base de datos")
+            saved_questions = self.save_questions(questions)
+
+            logger.info(f"Número de preguntas guardadas: {len(saved_questions)}")
+
+            return saved_questions
+        except Exception as e:
+            logger.error(f"Error al generar preguntas: {str(e)}")
+            raise
 
     def create_prompt(self, text):
         return f"""
-        Estructura un examen basado en el siguiente contenido: "{text}".
+        Genera un examen basado en el siguiente texto: "{text[:500]}...".
         El examen debe contener:
-        1. Cinco preguntas de selección múltiple, cada una con cuatro opciones. Una de estas opciones debe ser la respuesta correcta.
-        2. Cinco preguntas de verdadero o falso. Incluye también las respuestas correctas.
-        
+        1. Tres preguntas de selección múltiple, cada una con cuatro opciones. Una de estas opciones debe ser la respuesta correcta.
+        2. Dos preguntas de verdadero o falso. Incluye también las respuestas correctas.
+
         Formato para preguntas de selección múltiple:
         Q: [Pregunta]
         A) [Opción A]
@@ -70,28 +114,8 @@ class DocumentManager:
 
         return questions
 
-
-document_manager = DocumentManager()
-
-
-class Document(models.Model):
-    file = models.FileField(upload_to='documents/')
-    uploaded_at = models.DateTimeField(auto_now_add=True)
-
-    def extract_text(self):
-        with fitz.open(self.file.path) as doc:
-            text = ""
-            for page in doc:
-                text += page.get_text()
-        return text
-
-    def generate_questions(self):
-        text = self.extract_text()
-        questions = document_manager.generate_questions(text)
-        self.save_questions(questions)
-        return questions
-
     def save_questions(self, questions):
+        saved_questions = []
         for q_data in questions:
             question = Question.objects.create(
                 document=self,
@@ -104,8 +128,8 @@ class Document(models.Model):
                     text=ans_data['text'],
                     is_correct=ans_data['is_correct']
                 )
-
-
+            saved_questions.append(question)
+        return saved_questions
 class Question(models.Model):
     QUESTION_TYPES = (
         ('multiple_choice', 'Multiple Choice'),
