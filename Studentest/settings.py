@@ -153,6 +153,6 @@ LOGGING = {
     },
     'root': {
         'handlers': ['console', 'file'],
-        'level': 'ERROR',
+        'level': 'INFO',
     },
 }

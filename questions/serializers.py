@@ -22,4 +22,3 @@ class DocumentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Document
         fields = ['id', 'file', 'uploaded_at', 'questions']
-
